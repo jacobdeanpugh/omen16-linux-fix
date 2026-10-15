@@ -96,12 +96,36 @@ Some properties of this design:
 ### Before installing Linux (in Windows)
 
 1. Turn off **BitLocker / Device encryption** (Settings → Privacy & security → Device encryption) and save the recovery key. Omarchy's same-drive install requires it to be off.
-2. Shrink `C:` in Disk Management to leave unallocated space for Linux.
-3. Optional: plug in your monitors and check Settings → System → Display → Advanced display to see which GPU drives HDMI and USB-C.
-4. In the BIOS (F10), turn off **Secure Boot**. Omarchy requires this, and it also means the module doesn't need signing.
-5. Install Omarchy with the **free-space** option. Choose the OS at power-on with **F9**.
+2. Turn off **Fast Startup**: Control Panel → Power Options → *Choose what the power buttons do* → *Change settings that are currently unavailable* → untick *Turn on fast startup*. With it on, Windows "shutdown" is really a partial hibernate. That leaves the Windows partition unsafe to mount from Linux and breaks clean switching between OSes.
+3. Make Windows keep the **hardware clock in UTC**, as Linux does. Otherwise Linux's clock is 7–8 h off after every Windows session until it syncs online. Run this in an **admin** terminal:
+   ```
+   reg add "HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation" /v RealTimeIsUniversal /t REG_QWORD /d 1 /f
+   ```
+4. Shrink `C:` in Disk Management to leave unallocated space for Linux.
+5. Optional: plug in your monitors and check Settings → System → Display → Advanced display to see which GPU drives HDMI and USB-C.
+6. In the BIOS (F10), turn off **Secure Boot**. Omarchy requires this, and it also means the module doesn't need signing.
+7. Install Omarchy with the **free-space** option. See [Switching between Windows and Omarchy](#switching-between-windows-and-omarchy).
 
 Use NVIDIA's driver (`nvidia-open`), not nouveau. Omarchy installs `nvidia-open` automatically for RTX cards.
+
+### Switching between Windows and Omarchy
+
+Pick the OS at power-on with the BIOS boot menu (**F9**). There is no shared dual-boot menu:
+
+- **Each OS boots independently.** Omarchy's free-space install creates its own ~2 GB EFI partition (`omarchy-efi`) with its own boot loader (Limine), and leaves Windows' EFI partition untouched. Limine boots only Omarchy; don't add Windows to it (`limine-scan`).
+- **The default OS** (the one that starts when you don't press F9) is set by the BIOS (F10) boot order. Windows updates sometimes move *Windows Boot Manager* back to the top.
+
+**If Omarchy doesn't appear in F9** and the laptop boots straight into Windows: HP firmware is known to hide or drop Linux boot entries. Omarchy's free-space installer also doesn't currently install the backup boot file that firmware falls back to (`EFI/BOOT/BOOTX64.EFI`; see [omarchy#11997](https://github.com/omacom/omarchy/issues/11997) and [omarchy-iso#158](https://github.com/omacom/omarchy-iso/pull/158)). To recover:
+
+1. Press **F9** → **Boot From EFI File**. Pick the Omarchy EFI partition, then `EFI` → `Limine` → `limine_x64.efi` (or whichever `.efi` file is in that folder).
+2. Once you're in Omarchy, install the backup boot file so the firmware can always find it:
+   ```bash
+   sudo sed -i 's/^ENABLE_LIMINE_FALLBACK=.*/ENABLE_LIMINE_FALLBACK=yes/' /etc/default/limine
+   grep -q '^ENABLE_LIMINE_FALLBACK=' /etc/default/limine || echo 'ENABLE_LIMINE_FALLBACK=yes' | sudo tee -a /etc/default/limine
+   sudo limine-install --no-efi-register
+   ls -l /boot/EFI/BOOT/BOOTX64.EFI     # must exist now
+   ```
+   The setting stays in place, so Limine updates keep the backup file current. If F9 still doesn't list Omarchy, *Boot From EFI File* always works.
 
 ### After installing Omarchy
 
@@ -146,6 +170,7 @@ powered off at    hours  Wh used  avg W  fix  verdict
   - it was a real poweroff, not a reboot
 - Longer windows are more accurate. The boot reading is taken after you unlock the disk, so the boot itself adds about 0.1–0.3 Wh.
 - **Don't boot Windows between a Linux shutdown and the next Linux boot.** The ledger can't see Windows, so that time would be counted as "off".
+- The off-time is measured with the hardware clock at both shutdown and boot, so it stays correct even if Windows keeps that clock in local time. A window where the clock moves backwards or jumps by weeks is rejected.
 - `fix` shows whether `omen_s5` was loaded at shutdown. `displays` shows what was connected and which GPU drove it.
 
 ---

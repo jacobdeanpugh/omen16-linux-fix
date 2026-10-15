@@ -16,7 +16,7 @@ LEDGER=$STATE_DIR/ledger.tsv
 UNIT=/etc/systemd/system/omen-drain.service
 BIN=/usr/local/bin/omen-drain
 MIN_MINUTES=15
-HEADER=$'epoch\ttime\tevent\ttarget\twh\tac\tkernel\tfix\tdgpu\tdisplays\tbios'
+HEADER=$'epoch\ttime\tevent\ttarget\twh\tac\tkernel\tfix\tdgpu\tdisplays\tbios\trtc'
 
 die() { echo "omen-drain: $*" >&2; exit 1; }
 need_root() { [[ $(id -u) -eq 0 ]] || exec sudo "$0" "$@"; }
@@ -84,6 +84,11 @@ connected_displays() {
     echo "${out[*]:-none}"
 }
 
+# Raw hardware clock (RTC) seconds. The off-window is measured RTC-to-RTC, so it
+# stays correct even when Windows keeps the RTC in local time: both readings
+# share the same basis as long as no other OS ran in between.
+rtc_seconds() { cat /sys/class/rtc/rtc0/since_epoch 2>/dev/null || echo NA; }
+
 shutdown_target() {
     local jobs
     jobs=$(systemctl list-jobs --no-legend 2>/dev/null || true)
@@ -102,11 +107,11 @@ record() {
     mkdir -p "$STATE_DIR"
     [[ -s $LEDGER ]] || printf '%s\n' "$HEADER" > "$LEDGER"
     chmod 0644 "$LEDGER"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$(date +%s)" "$(date -Is)" "$event" "$target" "$(battery_wh)" "$(on_ac)" \
         "$(uname -r)" "$([[ -d /sys/module/omen_s5 ]] && echo on || echo off)" \
         "$(dgpu_state)" "$(connected_displays)" "$(cat /sys/class/dmi/id/bios_version 2>/dev/null || echo ?)" \
-        >> "$LEDGER"
+        "$(rtc_seconds)" >> "$LEDGER"
     sync "$LEDGER" 2>/dev/null || sync
 }
 
@@ -120,15 +125,19 @@ report() {
         }
         function bad(msg) { printf "%s %8s %6s  %-3s  %s\n", line, "-", "-", fix, msg }
         NR == 1 { next }
-        $3 == "shutdown" { se=$1; st=$2; tg=$4; sw=$5; sac=$6; fix=$8; dg=$9; disp=$10; have=1; next }
+        $3 == "shutdown" { se=$1; st=$2; tg=$4; sw=$5; sac=$6; fix=$8; dg=$9; disp=$10; srtc=$12; have=1; next }
         $3 == "boot" && have {
             have = 0
             if (tg != "poweroff") { skipped++; next }
-            h = ($1 - se) / 3600
+            # Prefer RTC-to-RTC (immune to local-time RTC); fall back to wall clock.
+            if (srtc ~ /^[0-9]+$/ && $12 ~ /^[0-9]+$/) secs = $12 - srtc
+            else                                       secs = $1 - se
+            h = secs / 3600
             line = sprintf("%-16s %6.2f", substr(st, 1, 16), h)
             if (sw == "NA" || $5 == "NA")     { bad("invalid: no battery reading"); next }
             used = sw - $5
             if (sac == 1 || $6 == 1)          { bad("invalid: charger connected"); next }
+            if (h < 0 || h > 24 * 30)         { bad("invalid: clock changed while off (another OS booted?)"); next }
             if (h * 60 < minm)                { bad("too short (<" minm " min)"); next }
             if (used < 0)                     { bad("invalid: battery gained charge"); next }
             w = used / h
