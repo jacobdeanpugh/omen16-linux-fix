@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Battery ledger: measures how much power the laptop draws while "off".
+#
+# A systemd service records the battery energy at every shutdown (ExecStop)
+# and every boot (ExecStart). `report` pairs each poweroff with the next boot
+# and prints the average watts drawn in between:
+#   real S5 is about 0.3-2 W, and a dGPU left powered is about 19-21 W.
+#
+#   sudo omen-drain install     install + enable the service
+#   omen-drain report           show every measured off-window
+#   sudo omen-drain uninstall   remove the service (keeps the ledger)
+set -euo pipefail
+
+STATE_DIR=/var/lib/omen-drain
+LEDGER=$STATE_DIR/ledger.tsv
+UNIT=/etc/systemd/system/omen-drain.service
+BIN=/usr/local/bin/omen-drain
+MIN_MINUTES=15
+HEADER=$'epoch\ttime\tevent\ttarget\twh\tac\tkernel\tfix\tdgpu\tdisplays\tbios'
+
+die() { echo "omen-drain: $*" >&2; exit 1; }
+need_root() { [[ $(id -u) -eq 0 ]] || exec sudo "$0" "$@"; }
+
+# Skips peripheral batteries (mice, headsets), which report scope=Device.
+is_peripheral() { [[ $(cat "$1/scope" 2>/dev/null) == Device ]]; }
+
+find_battery() {
+    local p
+    for p in /sys/class/power_supply/*; do
+        [[ -r $p/type && $(<"$p/type") == Battery ]] || continue
+        is_peripheral "$p" && continue
+        echo "$p"; return 0
+    done
+    return 1
+}
+
+# Remaining battery energy in Wh, or NA.
+battery_wh() {
+    local b
+    b=$(find_battery) || { echo NA; return; }
+    if [[ -r $b/energy_now ]]; then
+        awk -v e="$(<"$b/energy_now")" 'BEGIN { printf "%.3f", e / 1e6 }'
+    elif [[ -r $b/charge_now && -r $b/voltage_min_design ]]; then
+        awk -v c="$(<"$b/charge_now")" -v v="$(<"$b/voltage_min_design")" 'BEGIN { printf "%.3f", c * v / 1e12 }'
+    else
+        echo NA
+    fi
+}
+
+# 1 if any external power source (AC adapter or USB-C PD) is online.
+on_ac() {
+    local p
+    for p in /sys/class/power_supply/*; do
+        [[ -r $p/type && -r $p/online ]] || continue
+        is_peripheral "$p" && continue
+        case $(<"$p/type") in
+            Battery) ;;
+            *) if [[ $(<"$p/online") == 1 ]]; then echo 1; return; fi ;;
+        esac
+    done
+    echo 0
+}
+
+dgpu_state() {
+    local d
+    for d in /sys/bus/pci/devices/*; do
+        [[ $(<"$d/vendor") == 0x10de && $(<"$d/class") == 0x03* ]] || continue
+        echo "$(cat "$d/power/runtime_status" 2>/dev/null || echo ?)/$(cat "$d/power_state" 2>/dev/null || echo ?)"
+        return
+    done
+    echo none
+}
+
+connected_displays() {
+    local s conn card drv out=()
+    for s in /sys/class/drm/card*-*/status; do
+        [[ -r $s && $(<"$s") == connected ]] || continue
+        conn=${s%/status}; conn=${conn##*/}
+        card=${conn%%-*}
+        drv=$(basename "$(readlink -f "/sys/class/drm/$card/device/driver")")
+        out+=("${conn#*-}@$drv")
+    done
+    local IFS=,
+    echo "${out[*]:-none}"
+}
+
+shutdown_target() {
+    local jobs
+    jobs=$(systemctl list-jobs --no-legend 2>/dev/null || true)
+    case $jobs in
+        *poweroff.target*) echo poweroff ;;
+        *reboot.target*|*kexec.target*) echo reboot ;;
+        *halt.target*) echo halt ;;
+        *) echo unknown ;;
+    esac
+}
+
+record() {
+    local event=$1 target=-
+    [[ $event == boot || $event == shutdown ]] || die "record: expected boot|shutdown"
+    [[ $event == shutdown ]] && target=$(shutdown_target)
+    mkdir -p "$STATE_DIR"
+    [[ -s $LEDGER ]] || printf '%s\n' "$HEADER" > "$LEDGER"
+    chmod 0644 "$LEDGER"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(date +%s)" "$(date -Is)" "$event" "$target" "$(battery_wh)" "$(on_ac)" \
+        "$(uname -r)" "$([[ -d /sys/module/omen_s5 ]] && echo on || echo off)" \
+        "$(dgpu_state)" "$(connected_displays)" "$(cat /sys/class/dmi/id/bios_version 2>/dev/null || echo ?)" \
+        >> "$LEDGER"
+    sync "$LEDGER" 2>/dev/null || sync
+}
+
+report() {
+    [[ -r $LEDGER ]] || die "no ledger yet ($LEDGER). Run: sudo $0 install"
+    awk -F'\t' -v minm="$MIN_MINUTES" '
+        function verdict(w) {
+            if (w <= 3)  return "OK: really off"
+            if (w >= 8)  return "FAIL: dGPU still powered"
+            return "unclear"
+        }
+        function bad(msg) { printf "%s %8s %6s  %-3s  %s\n", line, "-", "-", fix, msg }
+        NR == 1 { next }
+        $3 == "shutdown" { se=$1; st=$2; tg=$4; sw=$5; sac=$6; fix=$8; dg=$9; disp=$10; have=1; next }
+        $3 == "boot" && have {
+            have = 0
+            if (tg != "poweroff") { skipped++; next }
+            h = ($1 - se) / 3600
+            line = sprintf("%-16s %6.2f", substr(st, 1, 16), h)
+            if (sw == "NA" || $5 == "NA")     { bad("invalid: no battery reading"); next }
+            used = sw - $5
+            if (sac == 1 || $6 == 1)          { bad("invalid: charger connected"); next }
+            if (h * 60 < minm)                { bad("too short (<" minm " min)"); next }
+            if (used < 0)                     { bad("invalid: battery gained charge"); next }
+            w = used / h
+            n++
+            printf "%s %8.2f %6.2f  %-3s  %s  [dGPU %s; displays %s]\n", line, used, w, fix, verdict(w), dg, disp
+            next
+        }
+        BEGIN { printf "%-16s %6s %8s %6s  %-3s  %s\n", "powered off at", "hours", "Wh used", "avg W", "fix", "verdict" }
+        END {
+            if (!n) print "\nNo valid off-windows yet: charger out at shutdown and at boot, off for at least " minm " min, and a real poweroff (not reboot)."
+            if (skipped) print "(" skipped " reboot/unknown window(s) skipped)"
+        }
+    ' "$LEDGER"
+}
+
+install_unit() {
+    need_root "$@"
+    install -Dm0755 "$(readlink -f "$0")" "$BIN"
+    cat > "$UNIT" <<EOF
+[Unit]
+Description=OMEN S5 battery ledger (records battery energy at boot and shutdown)
+RequiresMountsFor=$STATE_DIR
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$BIN record boot
+ExecStop=$BIN record shutdown
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now omen-drain.service
+    echo "installed: every boot and shutdown is now logged to $LEDGER"
+    echo "to measure: unplug the charger, 'systemctl poweroff', wait at least 1 h, boot, run 'omen-drain report'"
+}
+
+uninstall_unit() {
+    need_root "$@"
+    systemctl disable --now omen-drain.service 2>/dev/null || true
+    rm -f "$UNIT" "$BIN"
+    systemctl daemon-reload
+    echo "removed the service. The ledger is kept at $LEDGER"
+}
+
+case ${1:-report} in
+    record)    shift; [[ $(id -u) -eq 0 ]] || die "record must run as root"; record "${1:-}" ;;
+    report)    report ;;
+    install)   install_unit "$@" ;;
+    uninstall) uninstall_unit "$@" ;;
+    *)         sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

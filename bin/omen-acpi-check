@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Dump and disassemble this machine's ACPI tables, then confirm the firmware
+# has the layout the omen_s5 fix relies on:
+#   - _PTS (S5 prep) does nothing for the dGPU             (the HP bug)
+#   - PEGP._PS3 runs the power-off only when OMPR == 3     (what the fix arms)
+#   - PG00._OFF bails out unless NVDE == 1                 (set by the NVIDIA driver)
+#
+#   sudo omen-acpi-check [output-dir]
+set -euo pipefail
+
+# DSDT as read from the Windows registry on this laptop (BIOS F.13), 2026-10-15.
+EXPECT_DSDT_SHA256=50c13dce0bb725b6b3ce3f797dce8e3680ecc76c42d6f1874135bc53bd1b3d21
+EXPECT_DSDT_OEMREV=01072009
+
+[[ $(id -u) -eq 0 ]] || exec sudo "$0" "$@"
+
+OUT=$(readlink -f "${1:-./acpi-dump-$(date +%Y%m%d-%H%M%S)}")
+FAILS=0
+
+pass() { printf '  [PASS] %s\n' "$*"; }
+fail() { printf '  [FAIL] %s\n' "$*"; FAILS=$((FAILS + 1)); }
+note() { printf '         %s\n' "$*"; }
+head1() { printf '\n== %s\n' "$*"; }
+
+# Print every block starting at a line matching $2 (ending at its closing brace)
+# that also contains $3, with line numbers.
+block() {
+    awk -v hdr="$2" -v need="$3" '
+        !inb && $0 ~ hdr { inb = 1; depth = 0; started = 0; buf = "" }
+        inb {
+            buf = buf sprintf("%6d  %s\n", FNR, $0)
+            o = gsub(/\{/, "{"); c = gsub(/\}/, "}")
+            depth += o - c
+            if (o) started = 1
+            if (started && depth <= 0) { if (buf ~ need) printf "%s", buf; inb = 0 }
+        }' "$1"
+}
+
+if ! command -v iasl >/dev/null; then
+    echo "iasl not found, installing the acpica package"
+    pacman -S --needed acpica
+fi
+
+mkdir -p "$OUT"
+cd "$OUT"
+exec > >(tee summary.txt) 2>&1
+
+head1 "Collecting tables into $OUT"
+cp /sys/firmware/acpi/tables/DSDT dsdt.dat
+for t in /sys/firmware/acpi/tables/SSDT*; do cp "$t" "$(basename "$t" | tr 'A-Z' 'a-z').dat"; done
+if [[ -d /sys/firmware/acpi/tables/dynamic ]]; then
+    for t in /sys/firmware/acpi/tables/dynamic/*; do cp "$t" "dyn-$(basename "$t" | tr 'A-Z' 'a-z').dat"; done
+fi
+mapfile -t tables < <(ls ./*.dat)
+note "${#tables[@]} tables copied"
+# Disassemble each table with the others as externals so method calls decode correctly.
+for f in "${tables[@]}"; do
+    others=()
+    for g in "${tables[@]}"; do
+        if [[ $g != "$f" ]]; then others+=("$g"); fi
+    done
+    iasl -e "${others[@]}" -d "$f" >/dev/null 2>&1 \
+        || iasl -d "$f" >/dev/null 2>&1 \
+        || note "iasl could not disassemble $f"
+done
+
+head1 "DSDT identity"
+sha=$(sha256sum dsdt.dat | cut -d' ' -f1)
+rev=$(od -An -tx4 -j24 -N4 dsdt.dat | tr -d ' ')
+note "OEM ID / table: $(dd if=dsdt.dat bs=1 skip=10 count=6 2>/dev/null) / $(dd if=dsdt.dat bs=1 skip=16 count=8 2>/dev/null)"
+note "OEM revision:   0x$rev"
+note "sha256:         $sha"
+if [[ $sha == "$EXPECT_DSDT_SHA256" ]]; then
+    pass "identical to the DSDT captured from Windows on this laptop (BIOS F.13)"
+elif [[ $rev == "$EXPECT_DSDT_OEMREV" ]]; then
+    note "same OEM revision as the Windows capture but different bytes. Check the BIOS version."
+else
+    note "different DSDT revision than the Windows capture. Was the BIOS updated? Re-review before trusting the fix."
+fi
+
+head1 "Where the pieces live"
+ompr_file=$(grep -l 'Name (OMPR' ./*.dsl 2>/dev/null | head -n1 || true)
+pg00_file=$(grep -l 'PowerResource (PG00' ./*.dsl 2>/dev/null | head -n1 || true)
+note "OMPR defined in:     ${ompr_file:-NOT FOUND}"
+note "PG00 defined in:     ${pg00_file:-NOT FOUND}"
+note "NVDE declared at:"
+grep -n -E '^\s+NVDE,|Name \(NVDE' ./*.dsl 2>/dev/null | sed 's/^/           /' || note "  NOT FOUND"
+note "OMPR written at:"
+grep -n -E 'OMPR = |Store \([^)]*, OMPR\)' ./*.dsl 2>/dev/null | sed 's/^/           /' || true
+note "NVDE written at:"
+grep -n -E 'NVDE = |Store \([^)]*, NVDE\)' ./*.dsl 2>/dev/null | sed 's/^/           /' || true
+
+head1 "_PTS (runs at S5 prep)"
+pts=$(block dsdt.dsl 'Method \\(_PTS' '')
+printf '%s\n' "$pts"
+if grep -q -E 'PEGP|PG00|OMPR' <<<"$pts"; then
+    fail "_PTS references the dGPU. The firmware may have been fixed; re-check before installing omen_s5."
+else
+    pass "_PTS does not touch the dGPU directly (the HP bug the fix works around)"
+    note "(helpers that _PTS calls are not followed. Read the block above if it calls any.)"
+fi
+
+if [[ -n $ompr_file ]]; then
+    head1 "PEGP._PS3 (the method the fix calls)"
+    ps3=$(block "$ompr_file" 'Method \\(_PS3' 'OMPR')
+    printf '%s\n' "$ps3"
+    if grep -q -E 'OMPR == 0x03' <<<"$ps3"; then pass "_PS3 powers off only when OMPR == 3 (the fix sets OMPR = 3 first)"
+    else fail "no 'OMPR == 0x03' guard in _PS3. The fix's assumption does not hold."; fi
+    grep -q 'Scope (\\_SB.PCI0.GPP0.PEGP)\|Device (PEGP)' "$ompr_file" \
+        && pass "\\_SB.PCI0.GPP0.PEGP exists (the path omen_s5 checks at load)" \
+        || fail "\\_SB.PCI0.GPP0.PEGP not found in $ompr_file"
+else
+    fail "OMPR not found in any table. omen_s5 will refuse to load."
+fi
+
+if [[ -n $pg00_file ]]; then
+    head1 "PG00._OFF (cuts the dGPU power rail)"
+    off=$(block "$pg00_file" 'Method \\(_OFF' 'NVDE')
+    printf '%s\n' "$off"
+    if grep -q -E 'NVDE != One' <<<"$off"; then pass "_OFF requires NVDE == 1, which the NVIDIA driver sets. Keep nvidia(-open) loaded."
+    else fail "no 'NVDE != One' guard in PG00._OFF. Firmware differs from the analysed one; review by hand."; fi
+else
+    fail "PowerResource PG00 not found"
+fi
+
+head1 "omen_s5 runtime table"
+if grep -l -a 'OMENS5' ./dyn-*.dat >/dev/null 2>&1; then
+    pass "\\OS5F SSDT is loaded (omen_s5 is active this boot)"
+else
+    note "\\OS5F not loaded (normal before installing omen_s5)"
+fi
+
+head1 "Result"
+if (( FAILS == 0 )); then
+    echo "  Firmware matches what omen16-s5-fix expects. Safe to run: sudo bin/omen-s5-install"
+else
+    echo "  $FAILS check(s) failed. Do not install omen_s5 until they are understood."
+fi
+echo "  Full dump and disassembly: $OUT"
+[[ -n ${SUDO_USER:-} ]] && chown -R "$SUDO_USER": "$OUT"
+exit $(( FAILS > 0 ))

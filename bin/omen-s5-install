@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Install (or remove) the omen_s5 kernel module from Adiakys/omen16-s5-fix
+# via DKMS on Arch-based systems (Omarchy, CachyOS).
+#
+# Only the four files that get compiled are used. They are fetched at a pinned
+# commit and checked against the SHA-256 hashes that were reviewed (see README).
+# Upstream's install.sh is not run.
+#
+#   sudo omen-s5-install             install / reinstall
+#   sudo omen-s5-install uninstall   remove (module stays active until reboot)
+set -euo pipefail
+
+UPSTREAM=https://github.com/Adiakys/omen16-s5-fix.git
+COMMIT=13740806f876f3884963621ccc9dedef828edb5c
+declare -A PINNED=(
+    [src/omen_s5.c]=917b0d3246ceca9927519ca82e6defbb6f68e63d96b9127351439fc5ddd41d1b
+    [src/os5f_aml.h]=0459accc9a7cc77c4214036d5cc503f29444d1d78ef35b975c99262e29c8e3dc
+    [src/Makefile]=02867af7175c2e4eca08949ed7bc93317d016cfb4a5a10babff8cbf2d6743da5
+    [src/dkms.conf]=0a5e228ae95e5f3f1b7a0ba343bbda86648e68663624d57fba0d70b146c7d23b
+)
+NAME=omen-s5
+VER=1.0
+SRC=/usr/src/$NAME-$VER
+LOADCONF=/etc/modules-load.d/omen-s5.conf
+
+die() { echo "omen-s5-install: $*" >&2; exit 1; }
+step() { printf '\n== %s\n' "$*"; }
+
+[[ $(id -u) -eq 0 ]] || exec sudo "$0" "$@"
+
+TMP=
+trap 'if [[ -n $TMP ]]; then rm -rf "$TMP"; fi' EXIT
+
+do_uninstall() {
+    dkms remove "$NAME/$VER" --all 2>/dev/null || true
+    rm -rf "$SRC" "$LOADCONF"
+    echo "removed. omen_s5 cannot be unloaded at runtime, so it stays active until the next reboot."
+}
+
+do_install() {
+    step "1/5 checks"
+    [[ $(cat /sys/class/dmi/id/board_name) == 8E35 ]] || die "board is not 8E35 (HP OMEN 16-ap0xxx)"
+    command -v pacman >/dev/null || die "this installer targets Arch-based systems (pacman)"
+
+    step "2/5 dependencies"
+    local pkgs=(git dkms) k
+    for k in /usr/lib/modules/*/pkgbase; do
+        [[ -r $k ]] && pkgs+=("$(<"$k")-headers")
+    done
+    pacman -S --needed "${pkgs[@]}"
+
+    step "3/5 fetch pinned source"
+    TMP=$(mktemp -d)
+    git clone --quiet "$UPSTREAM" "$TMP/repo"
+    git -C "$TMP/repo" -c advice.detachedHead=false checkout --quiet "$COMMIT"
+    [[ $(git -C "$TMP/repo" rev-parse HEAD) == "$COMMIT" ]] || die "could not check out $COMMIT"
+    local f
+    for f in "${!PINNED[@]}"; do
+        echo "${PINNED[$f]}  $TMP/repo/$f" | sha256sum --check --quiet \
+            || die "$f does not match the reviewed hash. Refusing to build."
+    done
+    echo "commit $COMMIT, all 4 files match the reviewed hashes"
+
+    step "4/5 build with DKMS"
+    dkms remove "$NAME/$VER" --all >/dev/null 2>&1 || true
+    rm -rf "$SRC"
+    install -d "$SRC"
+    for f in "${!PINNED[@]}"; do install -m0644 "$TMP/repo/$f" "$SRC/"; done
+    dkms add "$NAME/$VER"
+    local built=0 kdir
+    for kdir in /usr/lib/modules/*; do
+        [[ -d $kdir/build ]] || continue
+        dkms install "$NAME/$VER" -k "${kdir##*/}" \
+            || die "build failed for ${kdir##*/}. See /var/lib/dkms/$NAME/$VER/build/make.log"
+        built=$((built + 1))
+    done
+    (( built )) || die "no kernel headers found under /usr/lib/modules/*/build"
+
+    step "5/5 load"
+    echo omen_s5 > "$LOADCONF"
+    if [[ -d /sys/module/omen_s5 ]]; then
+        echo "omen_s5 was already loaded. The rebuilt module takes over after a reboot."
+    else
+        modprobe omen_s5 || die "modprobe failed. See: journalctl -k -b | grep omen_s5"
+    fi
+    dmesg | grep 'omen_s5' | tail -n 3 || true
+    dmesg | grep -q 'omen_s5: ready' || die "module did not report 'ready'"
+
+    cat <<'EOF'
+
+Installed. The dGPU will now be powered off right after _PTS(5) on every poweroff.
+Verify with a measurement: charger out -> systemctl poweroff -> wait >= 1 h ->
+boot -> omen-drain report   (expect ~0.3-2 W instead of ~20 W)
+EOF
+}
+
+case ${1:-install} in
+    install)   do_install ;;
+    uninstall) do_uninstall ;;
+    *)         die "usage: $0 [install|uninstall]" ;;
+esac

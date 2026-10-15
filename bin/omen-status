@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Read-only health check for the OMEN 16 (8E35) S5 shutdown fix.
+# Prints the machine, Secure Boot, dGPU power, display and fix state.
+set -uo pipefail
+
+ok()   { printf '  [ OK ] %s\n' "$*"; }
+warn() { printf '  [WARN] %s\n' "$*"; }
+info() { printf '         %s\n' "$*"; }
+head1() { printf '\n== %s\n' "$*"; }
+readf() { [[ -r $1 ]] && cat "$1" 2>/dev/null || echo "?"; }
+
+find_dgpu() {
+    local d
+    for d in /sys/bus/pci/devices/*; do
+        [[ $(readf "$d/vendor") == 0x10de && $(readf "$d/class") == 0x03* ]] || continue
+        echo "$d"; return 0
+    done
+    return 1
+}
+
+head1 "Machine"
+board=$(readf /sys/class/dmi/id/board_name)
+info "product: $(readf /sys/class/dmi/id/product_name)"
+info "board:   $board"
+info "BIOS:    $(readf /sys/class/dmi/id/bios_version) ($(readf /sys/class/dmi/id/bios_date))"
+info "kernel:  $(uname -r)"
+info "distro:  $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-?}")"
+if [[ $board == 8E35 ]]; then ok "board 8E35 (OMEN 16-ap0xxx): the fix applies"
+else warn "board is not 8E35: omen_s5 will refuse to load on this machine"; fi
+
+head1 "Secure Boot"
+sb=$(ls /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null)
+if [[ -n $sb ]] && [[ $(od -An -t u1 -j4 -N1 "$sb" | tr -d ' ') == 1 ]]; then
+    warn "enabled: the omen_s5 module must be signed with an enrolled key to load"
+else
+    ok "disabled (or not reported): no module signing needed"
+fi
+
+head1 "NVIDIA dGPU"
+if dgpu=$(find_dgpu); then
+    drv=$(basename "$(readlink -f "$dgpu/driver" 2>/dev/null)" 2>/dev/null)
+    info "device:  ${dgpu##*/}"
+    info "driver:  ${drv:-none}"
+    case $drv in
+        nvidia)
+            if grep -q 'Open Kernel Module' /proc/driver/nvidia/version 2>/dev/null; then
+                ok "nvidia open kernel module loaded (sets NVDE=1, which the fix needs)"
+            else
+                ok "nvidia driver loaded"
+            fi ;;
+        nouveau) warn "nouveau: the firmware's PG00._OFF needs NVDE=1, which only the NVIDIA driver sets. The fix will run but likely do nothing." ;;
+        *)       warn "no driver bound: PG00._OFF will likely do nothing (NVDE is set by the NVIDIA driver)" ;;
+    esac
+    info "runtime: $(readf "$dgpu/power/runtime_status")   power state: $(readf "$dgpu/power_state")   control: $(readf "$dgpu/power/control")   d3cold_allowed: $(readf "$dgpu/d3cold_allowed")"
+    for p in /proc/driver/nvidia/gpus/*/power; do
+        [[ -r $p ]] && sed 's/^/         /' "$p"
+    done
+else
+    warn "no NVIDIA display device found on the PCI bus"
+fi
+
+head1 "Displays (connector -> driving GPU)"
+any=0
+for s in /sys/class/drm/card*-*/status; do
+    [[ -r $s && $(cat "$s") == connected ]] || continue
+    conn=${s%/status}; conn=${conn##*/}
+    card=${conn%%-*}
+    gdrv=$(basename "$(readlink -f "/sys/class/drm/$card/device/driver")")
+    info "$conn  ->  $gdrv"
+    any=1
+done
+(( any )) || info "none connected"
+info "Outputs on 'nvidia' keep the dGPU awake. The fix powers it off at shutdown anyway."
+
+head1 "S5 fix (omen_s5)"
+if [[ -d /sys/module/omen_s5 ]]; then
+    ok "module loaded"
+else
+    warn "module NOT loaded: the dGPU will stay powered after shutdown (~20 W drain)"
+fi
+command -v dkms >/dev/null && dkms status omen-s5 2>/dev/null | sed 's/^/         dkms: /'
+if command -v journalctl >/dev/null; then
+    journalctl -k -b --no-pager -q -g 'omen_s5' 2>/dev/null | sed 's/^/         /' | tail -n 5
+fi
+
+head1 "ACPI firmware errors this boot"
+if command -v journalctl >/dev/null; then
+    n=$(journalctl -k -b --no-pager -q -g 'AE_AML_BUFFER_LIMIT|WQBZ|WQBE' 2>/dev/null | wc -l)
+    info "$n line(s) mentioning WQBZ/WQBE/AE_AML_BUFFER_LIMIT. This is a known, separate HP bug, cosmetic for shutdown."
+fi
+
+head1 "Drain ledger"
+if systemctl is-enabled omen-drain.service >/dev/null 2>&1; then
+    ok "omen-drain.service enabled: every boot/shutdown is logged. See: omen-drain report"
+else
+    warn "omen-drain.service not installed: run 'sudo bin/omen-drain install' to measure shutdown drain"
+fi
