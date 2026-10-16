@@ -83,8 +83,12 @@ do_install() {
     else
         modprobe omen_s5 || die "modprobe failed. See: journalctl -k -b | grep omen_s5"
     fi
-    dmesg | grep 'omen_s5' | tail -n 3 || true
-    dmesg | grep -q 'omen_s5: ready' || die "module did not report 'ready'"
+    # The journal keeps this boot's kernel log; dmesg's ring buffer may have
+    # dropped the 'ready' line if the module loaded long ago.
+    local klog
+    klog=$(journalctl -k -b --no-pager -q -g 'omen_s5' 2>/dev/null || dmesg | grep 'omen_s5' || true)
+    tail -n 3 <<<"$klog"
+    grep -q 'omen_s5: ready' <<<"$klog" || die "module did not report 'ready'"
 
     cat <<'EOF'
 

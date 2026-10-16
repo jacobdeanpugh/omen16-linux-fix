@@ -93,7 +93,9 @@ grep -n -E 'NVDE = |Store \([^)]*, NVDE\)' ./*.dsl 2>/dev/null | sed 's/^/      
 head1 "_PTS (runs at S5 prep)"
 pts=$(block dsdt.dsl 'Method \\(_PTS' '')
 printf '%s\n' "$pts"
-if grep -q -E 'PEGP|PG00|OMPR' <<<"$pts"; then
+if [[ -z $pts ]]; then
+    fail "_PTS not found in dsdt.dsl (did iasl disassemble the DSDT?)"
+elif grep -q -E 'PEGP|PG00|OMPR' <<<"$pts"; then
     fail "_PTS references the dGPU. The firmware may have been fixed; re-check before installing omen_s5."
 else
     pass "_PTS does not touch the dGPU directly (the HP bug the fix works around)"

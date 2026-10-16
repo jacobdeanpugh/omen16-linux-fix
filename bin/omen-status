@@ -60,7 +60,7 @@ else
 fi
 
 head1 "Displays (connector -> driving GPU)"
-any=0
+any=0 on_nvidia=0
 for s in /sys/class/drm/card*-*/status; do
     [[ -r $s && $(cat "$s") == connected ]] || continue
     conn=${s%/status}; conn=${conn##*/}
@@ -68,9 +68,10 @@ for s in /sys/class/drm/card*-*/status; do
     gdrv=$(basename "$(readlink -f "/sys/class/drm/$card/device/driver")")
     info "$conn  ->  $gdrv"
     any=1
+    [[ $gdrv == nvidia ]] && on_nvidia=1
 done
 (( any )) || info "none connected"
-info "Outputs on 'nvidia' keep the dGPU awake. The fix powers it off at shutdown anyway."
+(( on_nvidia )) && info "Outputs on 'nvidia' keep the dGPU awake. The fix powers it off at shutdown anyway."
 
 head1 "S5 fix (omen_s5)"
 if [[ -d /sys/module/omen_s5 ]]; then
