@@ -42,15 +42,20 @@ if ! command -v iasl >/dev/null; then
 fi
 
 mkdir -p "$OUT"
+# Hand the dump back to the invoking user however the script exits.
+trap 'if [[ -n ${SUDO_USER:-} ]]; then chown -R "$SUDO_USER": "$OUT"; fi' EXIT
 cd "$OUT"
 exec > >(tee summary.txt) 2>&1
 
 head1 "Collecting tables into $OUT"
 cp /sys/firmware/acpi/tables/DSDT dsdt.dat
-for t in /sys/firmware/acpi/tables/SSDT*; do cp "$t" "$(basename "$t" | tr 'A-Z' 'a-z').dat"; done
-if [[ -d /sys/firmware/acpi/tables/dynamic ]]; then
-    for t in /sys/firmware/acpi/tables/dynamic/*; do cp "$t" "dyn-$(basename "$t" | tr 'A-Z' 'a-z').dat"; done
-fi
+# The dynamic/ dir can exist but be empty, so skip globs that match nothing.
+for t in /sys/firmware/acpi/tables/SSDT*; do
+    [[ -e $t ]] && cp "$t" "$(basename "$t" | tr 'A-Z' 'a-z').dat"
+done
+for t in /sys/firmware/acpi/tables/dynamic/*; do
+    [[ -e $t ]] && cp "$t" "dyn-$(basename "$t" | tr 'A-Z' 'a-z').dat"
+done
 mapfile -t tables < <(ls ./*.dat)
 note "${#tables[@]} tables copied"
 # Disassemble each table with the others as externals so method calls decode correctly.
@@ -139,5 +144,4 @@ else
     echo "  $FAILS check(s) failed. Do not install omen_s5 until they are understood."
 fi
 echo "  Full dump and disassembly: $OUT"
-[[ -n ${SUDO_USER:-} ]] && chown -R "$SUDO_USER": "$OUT"
 exit $(( FAILS > 0 ))
