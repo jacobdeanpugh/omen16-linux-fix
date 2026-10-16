@@ -11,7 +11,7 @@ This repo wraps the community fix [Adiakys/omen16-s5-fix](https://github.com/Adi
 
 Background, other approaches, and sources are in [RESEARCH.md](RESEARCH.md).
 
-> **Status:** not yet tested on this repo's laptop (16-ap0xxx, Ryzen 9 8940HX, RTX 5060, BIOS F.13). The same mechanism was measured at 21 W → 1–2 W on a 16-ap0004 (BIOS F.11). A DSDT-override version of it was validated on BIOS F.13.
+> **Status:** works on this repo's laptop (16-ap0xxx, Ryzen 9 8940HX, RTX 5060, BIOS F.13, kernel 7.2.5, nvidia-open 610.57.04). First measurement with the fix: **1.53 W** while off (0.51 Wh over 20 min on battery, including boot overhead). So far that's one short window with only the built-in display; longer windows and runs with external monitors attached are still to come. The same mechanism was measured at 21 W → 1–2 W on a 16-ap0004 (BIOS F.11).
 
 ---
 
